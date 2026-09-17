@@ -714,6 +714,56 @@ fn sync_once(cfg: &Cfg, server_id: &str, secret: &str) -> Result<usize, String> 
     Ok(n)
 }
 
+fn self_pid() -> u32 {
+    std::process::id()
+}
+
+/// PIDs of running `vpnyellod daemon` processes, excluding ourselves.
+/// Reads /proc directly: precise, no self-match footguns like pkill -f.
+fn daemon_pids() -> Vec<u32> {
+    let me = self_pid();
+    let mut out = vec![];
+    let procs = fs::read_dir("/proc").map(|d| d.flatten().collect::<Vec<_>>()).unwrap_or_default();
+    for e in procs {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let pid: u32 = match name.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if pid == me {
+            continue;
+        }
+        let cmd = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let parts: Vec<&str> = cmd.split(|b| *b == 0).filter_map(|s| std::str::from_utf8(s).ok()).filter(|s| !s.is_empty()).collect();
+        if parts.len() >= 2 && parts[parts.len() - 2].ends_with("vpnyellod") && parts[parts.len() - 1] == "daemon" {
+            out.push(pid);
+        }
+    }
+    out
+}
+
+/// Stop every stale `vpnyellod daemon` (duplicates from repeated `on`, orphans
+/// from killed shells). Exact-PID kills only — never pattern-matches.
+fn kill_stale_daemons() {
+    for pid in daemon_pids() {
+        // Re-verify identity just before killing (PID could theoretically wrap).
+        let cmd = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        if !String::from_utf8_lossy(&cmd).contains("vpnyellod") {
+            continue;
+        }
+        let _ = run("kill", &[&pid.to_string()]);
+        println!("[vpnyellod] stopped stale daemon (pid {pid})");
+    }
+    if !daemon_pids().is_empty() {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        for pid in daemon_pids() {
+            let _ = run("kill", &["-9", &pid.to_string()]);
+            println!("[vpnyellod] force-stopped daemon (pid {pid})");
+        }
+    }
+    let _ = fs::remove_file(PID_FILE);
+}
+
 fn has_systemd() -> bool {
     std::path::Path::new("/run/systemd/system").exists()
         && std::path::Path::new("/etc/systemd/system/vpnyellod.service").exists()
@@ -786,14 +836,13 @@ fn run_on(cfg: Cfg) {
     println!("[vpnyellod] registered as \"{}\" → {}/ (id {sid})", cfg.name, cfg.registry);
 
     // Daemon: systemd if available, else detached background loop.
-    // Re-running `on` first stops any previous daemon (exact PID from pidfile).
-    if let Ok(pid) = fs::read_to_string(PID_FILE) {
-        let _ = run("kill", &[pid.trim()]);
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
+    // First sweep any stale/duplicate daemons (exact PIDs, self excluded).
+    kill_stale_daemons();
     if has_systemd() {
         let _ = run("systemctl", &["daemon-reload"]);
-        if !run("systemctl", &["enable", "--now", "vpnyellod.service"]) {
+        // enable + RESTART (not just --now): guarantees the just-installed
+        // binary is what's running, even if an old daemon was already up.
+        if !run("systemctl", &["enable", "vpnyellod.service"]) || !run("systemctl", &["restart", "vpnyellod.service"]) {
             eprintln!("warn: could not start systemd unit — run `sudo vpnyellod daemon &` manually");
         } else {
             println!("[vpnyellod] daemon started (systemctl status vpnyellod)");
@@ -823,11 +872,7 @@ fn cmd_off() {
     if has_systemd() {
         let _ = run("systemctl", &["disable", "--now", "vpnyellod.service"]);
     }
-    if let Ok(pid) = fs::read_to_string(PID_FILE) {
-        let _ = run("kill", &[pid.trim()]);
-        let _ = fs::remove_file(PID_FILE);
-    }
-    let _ = run("pkill", &["-f", "vpnyellod daemon"]);
+    kill_stale_daemons();
     if iface_exists(&cfg) {
         let _ = run("wg-quick", &["down", &cfg.iface]);
         println!("[vpnyellod] {} down", cfg.iface);
@@ -854,6 +899,29 @@ fn cmd_status() {
     let listening = run_out("sh", &["-c", &format!("ss -uln 2>/dev/null | grep -w ':{}'", cfg.port)]).map(|s| !s.trim().is_empty()).unwrap_or(false)
         || proc_hit("/proc/net/udp") || proc_hit("/proc/net/udp6");
     println!("listening: {} (UDP {})", if listening { "YES" } else { "NO — restart with `sudo vpnyellod on`" }, cfg.port);
+    // Firewall report: the #1 handshake-timeout cause. Shows exactly what stands
+    // between the internet and the WireGuard port.
+    let ufw_st = run_out("ufw", &["status"]).unwrap_or_default();
+    let ufw_line = ufw_st.lines().next().unwrap_or("(ufw: unknown — run status as root)").to_string();
+    println!("firewall : {ufw_line}");
+    if ufw_line.contains("Status: active") {
+        let allowed = ufw_st.lines().any(|l| l.contains(&cfg.port.to_string()) && l.contains("ALLOW"));
+        if allowed {
+            println!("firewall : ufw UDP {} ALLOWED", cfg.port);
+        } else {
+            println!("firewall : ufw UDP {} NOT ALLOWED — run: sudo ufw allow {}/udp", cfg.port, cfg.port);
+        }
+    }
+    let fw_st = run_out("firewall-cmd", &["--state"]).unwrap_or_default();
+    if !fw_st.is_empty() {
+        println!("firewall : firewalld {fw_st}");
+    }
+    let hexport = format!(":{:04X}", cfg.port);
+    let in_input = |f: &str| std::fs::read_to_string(f).map(|t| t.lines().skip(1).any(|l| {
+        l.split_whitespace().nth(1).map(|a| a.to_uppercase().ends_with(&hexport)).unwrap_or(false)
+    })).unwrap_or(false);
+    let rules = (if in_input("/proc/net/udp") || in_input("/proc/net/udp6") { "socket open" } else { "NO SOCKET" }).to_string();
+    println!("firewall : udp/{p} kernel {rules} (raw iptables only matters when ufw+firewalld are off)", p = cfg.port);
     if iface_exists(&cfg) {
         if let Some(peers) = run_out("wg", &["show", &cfg.iface, "peers"]) {
             let n = if peers.is_empty() { 0 } else { peers.split_whitespace().count() };
