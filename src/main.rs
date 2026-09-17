@@ -64,6 +64,20 @@ fn cfg_get(key: &str) -> String {
     String::new()
 }
 
+fn default_name() -> String {
+    // Explicit VY_NAME wins; else keep the name from the previous registration
+    // (so `restart` doesn't rename the server); else hostname.
+    let v = cfg_get("VY_NAME");
+    if !v.trim().is_empty() {
+        return v.trim().to_string();
+    }
+    let (_, _, saved) = load_state();
+    if !saved.is_empty() {
+        return saved;
+    }
+    hostname()
+}
+
 fn hostname() -> String {
     let h = Command::new("hostname")
         .output()
@@ -84,7 +98,7 @@ impl Cfg {
             port: cfg_get("VY_PORT").parse().unwrap_or(51820),
             vpn4: non_empty(cfg_get("VY_VPN4"), "10.8.0.1/24"),
             vpn6: non_empty(cfg_get("VY_VPN6"), "fd86:ea04::1/64"),
-            name: non_empty(cfg_get("VY_NAME"), &hostname()),
+            name: default_name(),
             poll: poll.clamp(5, 600),
             conf_path: format!("/etc/wireguard/{iface}.conf"),
             key_path: non_empty(cfg_get("VY_KEY"), "/etc/wireguard/server_private.key"),
@@ -624,20 +638,22 @@ fn remove_peer(cfg: &Cfg, pubkey: &str) {
     }
 }
 
-fn save_state(server_id: &str, secret: &str) {
+fn save_state(server_id: &str, secret: &str, name: &str) {
     let _ = fs::create_dir_all(CONF_DIR);
-    let _ = fs::write(STATE_FILE, format!("SERVER_ID={server_id}\nSECRET={secret}\n"));
+    let _ = fs::write(STATE_FILE, format!("SERVER_ID={server_id}\nSECRET={secret}\nNAME={name}\n"));
 }
 
-fn load_state() -> (String, String) {
+fn load_state() -> (String, String, String) {
     let c = fs::read_to_string(STATE_FILE).unwrap_or_default();
     let mut id = String::new();
     let mut sec = String::new();
+    let mut name = String::new();
     for line in c.lines() {
         if let Some(v) = line.strip_prefix("SERVER_ID=") { id = v.trim().to_string(); }
         if let Some(v) = line.strip_prefix("SECRET=") { sec = v.trim().to_string(); }
+        if let Some(v) = line.strip_prefix("NAME=") { name = v.trim().to_string(); }
     }
-    (id, sec)
+    (id, sec, name)
 }
 
 fn heartbeat(cfg: &Cfg, server_id: &str, secret: &str, v4: &Option<String>, v6: &Option<String>) -> Result<Vec<WantedPeer>, String> {
@@ -703,6 +719,16 @@ fn has_systemd() -> bool {
         && std::path::Path::new("/etc/systemd/system/vpnyellod.service").exists()
 }
 
+fn cmd_restart() {
+    if !is_root() {
+        eprintln!("error: run as root: sudo vpnyellod restart");
+        std::process::exit(1);
+    }
+    println!("[vpnyellod] restarting (same server entry, keys kept)...");
+    cmd_off();
+    run_on(Cfg::load());
+}
+
 fn cmd_on(args: &[String]) {
     if !is_root() {
         eprintln!("error: run as root: sudo vpnyellod on");
@@ -718,6 +744,10 @@ fn cmd_on(args: &[String]) {
             if let Some(v) = it.next() { cfg.registry = v.trim_end_matches('/').to_string(); }
         }
     }
+    run_on(cfg);
+}
+
+fn run_on(cfg: Cfg) {
     for bin in ["wg", "wg-quick", "ip", "curl"] {
         if run_out("sh", &["-c", &format!("command -v {bin}")]).is_none() {
             eprintln!("error: missing `{bin}` — install it first (or use install.sh which handles debian/fedora/arch/gentoo)");
@@ -752,7 +782,7 @@ fn cmd_on(args: &[String]) {
     let resp = curl_post(&url, &body).unwrap_or_else(|e| { eprintln!("error: register failed: {e}"); std::process::exit(1); });
     let sid = jstr(&resp, "server_id").unwrap_or_else(|| { eprintln!("error: bad register response: {resp}"); std::process::exit(1); });
     let sec = jstr(&resp, "secret").unwrap_or_default();
-    save_state(&sid, &sec);
+    save_state(&sid, &sec, &cfg.name);
     println!("[vpnyellod] registered as \"{}\" → {}/ (id {sid})", cfg.name, cfg.registry);
 
     // Daemon: systemd if available, else detached background loop.
@@ -782,7 +812,7 @@ fn cmd_off() {
         std::process::exit(1);
     }
     let cfg = Cfg::load();
-    let (sid, sec) = load_state();
+    let (sid, sec, _) = load_state();
     if !sid.is_empty() && !sec.is_empty() {
         let url = format!("{}/api/servers/{sid}/offline", cfg.registry);
         match curl_post(&url, &format!("{{\"secret\":\"{sec}\"}}")) {
@@ -830,7 +860,7 @@ fn cmd_status() {
             println!("peers    : {n} client(s)");
         }
     }
-    let (sid, _) = load_state();
+    let (sid, _, _) = load_state();
     if !sid.is_empty() {
         println!("server_id: {sid}");
         if let Ok(l) = fs::read_to_string(LAST_FILE) {
@@ -855,7 +885,7 @@ fn cmd_daemon() {
         std::process::exit(1);
     }
     let cfg = Cfg::load();
-    let (sid, sec) = load_state();
+    let (sid, sec, _) = load_state();
     if sid.is_empty() || sec.is_empty() {
         eprintln!("error: not registered — run `sudo vpnyellod on` first");
         std::process::exit(1);
@@ -920,6 +950,7 @@ fn usage() -> ! {
     eprintln!("vpnyellod {VERSION} — YellowD VPN server agent");
     eprintln!("  sudo vpnyellod on [--name NAME] [--registry URL]");
     eprintln!("  sudo vpnyellod off                              (stop + deregister, keep files)");
+    eprintln!("  sudo vpnyellod restart                          (stop + fresh start, same entry)");
     eprintln!("  sudo vpnyellod uninstall                         (remove EVERYTHING incl. keys)");
     eprintln!("  vpnyellod status");
     eprintln!("  vpnyellod detect   (show local vs internet-visible IPs, no changes)");
@@ -931,6 +962,7 @@ fn main() {
     match args.get(1).map(|s| s.as_str()).unwrap_or("") {
         "on" => cmd_on(&args[1..].to_vec()),
         "off" => cmd_off(),
+        "restart" => cmd_restart(),
         "uninstall" => cmd_uninstall(),
         "status" => cmd_status(),
         "detect" => print_report(&detect_full(), Cfg::load().port),
