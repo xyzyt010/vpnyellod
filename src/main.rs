@@ -870,10 +870,57 @@ fn cmd_daemon() {
     }
 }
 
+fn cmd_uninstall() {
+    if !is_root() {
+        eprintln!("error: run as root: sudo vpnyellod uninstall");
+        std::process::exit(1);
+    }
+    let cfg = Cfg::load();
+    println!("[vpnyellod] UNINSTALL — removing server, daemon, firewall rules, keys, and files.");
+    println!("[vpnyellod] WARNING: all client .conf files for this server die with it (keys are deleted).");
+    // 1. Normal off first: deregister from website, stop daemon, iface down, firewall cleanup.
+    cmd_off();
+    // 2. Systemd unit.
+    let _ = run("systemctl", &["disable", "vpnyellod.service"]);
+    remove_path("/etc/systemd/system/vpnyellod.service");
+    let _ = run("systemctl", &["daemon-reload"]);
+    // 3. Agent config/state/data + logs.
+    remove_path(CONF_DIR);
+    remove_path("/var/lib/vpnyellod");
+    remove_path("/var/log/vpnyellod.log");
+    remove_path(PID_FILE);
+    // 4. WireGuard server config + keys (ONLY this agent's interface/key).
+    remove_path(&cfg.conf_path);
+    remove_path(&cfg.key_path);
+    // 5. The installed binary itself (Linux allows deleting a running executable).
+    const INSTALLED_BIN: &str = "/usr/local/bin/vpnyellod";
+    let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    if std::path::Path::new(INSTALLED_BIN).exists() {
+        remove_path(INSTALLED_BIN);
+    }
+    if !exe.is_empty() && exe != INSTALLED_BIN {
+        println!("[vpnyellod] note: running binary was {exe} (dev copy?) — left in place.");
+    }
+    println!("[vpnyellod] uninstalled completely. Reinstall any time with the one-line installer.");
+}
+
+fn remove_path(p: &str) {
+    if !std::path::Path::new(p).exists() {
+        return;
+    }
+    let ok = if std::path::Path::new(p).is_dir() {
+        fs::remove_dir_all(p).is_ok()
+    } else {
+        fs::remove_file(p).is_ok()
+    };
+    println!("[vpnyellod] {} {}", if ok { "removed" } else { "FAILED to remove" }, p);
+}
+
 fn usage() -> ! {
     eprintln!("vpnyellod {VERSION} — YellowD VPN server agent");
     eprintln!("  sudo vpnyellod on [--name NAME] [--registry URL]");
-    eprintln!("  sudo vpnyellod off");
+    eprintln!("  sudo vpnyellod off                              (stop + deregister, keep files)");
+    eprintln!("  sudo vpnyellod uninstall                         (remove EVERYTHING incl. keys)");
     eprintln!("  vpnyellod status");
     eprintln!("  vpnyellod detect   (show local vs internet-visible IPs, no changes)");
     std::process::exit(2);
@@ -884,6 +931,7 @@ fn main() {
     match args.get(1).map(|s| s.as_str()).unwrap_or("") {
         "on" => cmd_on(&args[1..].to_vec()),
         "off" => cmd_off(),
+        "uninstall" => cmd_uninstall(),
         "status" => cmd_status(),
         "detect" => print_report(&detect_full(), Cfg::load().port),
         "daemon" => cmd_daemon(),
