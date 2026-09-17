@@ -1,6 +1,6 @@
 [package]
 name = "vpnyellod"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "YellowD VPN server agent: auto-setup WireGuard, register on vpn.yellod.dpdns.org, apply client peers. One codebase, x86_64 + aarch64."
 license = "MIT"

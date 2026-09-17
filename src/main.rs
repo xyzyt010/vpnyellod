@@ -423,6 +423,33 @@ fn ensure_addrs(cfg: &Cfg) {
     let _ = run("ip", &["-6", "addr", "replace", &cfg.vpn6, "dev", &cfg.iface]);
 }
 
+/// Open the WireGuard UDP port in every local firewall present.
+/// Without this, handshakes time out even though everything else is correct.
+fn open_firewall(port: u16) {
+    // ufw (Ubuntu/Debian default): only touch it when it's active.
+    if let Some(st) = run_out("ufw", &["status"]) {
+        if st.lines().next().unwrap_or("").contains("Status: active") {
+            if run("ufw", &["allow", &format!("{port}/udp")]) {
+                println!("[vpnyellod] ufw: allowed {port}/udp");
+            } else {
+                eprintln!("[vpnyellod] WARN: ufw is active but the allow rule failed — run: sudo ufw allow {port}/udp");
+            }
+        }
+    }
+    // firewalld (Fedora/RHEL default): only touch it when running.
+    if run_out("firewall-cmd", &["--state"]).map(|s| s.trim() == "running").unwrap_or(false) {
+        let rule = format!("{port}/udp");
+        if run("firewall-cmd", &["--permanent", "--add-port", &rule]) && run("firewall-cmd", &["--reload"]) {
+            println!("[vpnyellod] firewalld: allowed {rule}");
+        } else {
+            eprintln!("[vpnyellod] WARN: firewalld is running but the rule failed — run: sudo firewall-cmd --permanent --add-port={rule} && sudo firewall-cmd --reload");
+        }
+    }
+    // Cloud security groups (AWS/Oracle/Azure/Hetzner/...) can't be automated —
+    // always remind, it's the #1 cause of handshake timeouts on VPS boxes.
+    println!("[vpnyellod] If this is a cloud VPS, ALSO open UDP {port} in the provider firewall/security-group console.");
+}
+
 fn bring_up(cfg: &Cfg) -> Result<(), String> {
     let _ = run("sysctl", &["-w", "net.ipv4.ip_forward=1"]);
     let _ = run("sysctl", &["-w", "net.ipv6.conf.all.forwarding=1"]);
@@ -590,11 +617,11 @@ fn load_state() -> (String, String) {
 
 fn heartbeat(cfg: &Cfg, server_id: &str, secret: &str, v4: &Option<String>, v6: &Option<String>) -> Result<Vec<WantedPeer>, String> {
     let body = format!(
-        "{{\"secret\":\"{sec}\",\"ipv4\":\"{v4}\",\"ipv6\":\"{v6}\",\"port\":{port}}}",
+        "{{\"secret\":\"{sec}\",\"ipv4\":\"{v4}\",\"ipv6\":\"{v6}\",\"port\":{port},\"vpn4\":\"{w4}\",\"vpn6\":\"{w6}\"}}",
         sec = secret,
         v4 = v4.clone().unwrap_or_default(),
         v6 = v6.clone().unwrap_or_default(),
-        port = cfg.port,
+        port = cfg.port, w4 = cfg.vpn4, w6 = cfg.vpn6,
     );
     let url = format!("{}/api/servers/{server_id}/heartbeat", cfg.registry);
     let resp = curl_post(&url, &body)?;
@@ -685,13 +712,16 @@ fn cmd_on(args: &[String]) {
     write_conf(&cfg, &privkey).unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1); });
     bring_up(&cfg).unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1); });
     println!("[vpnyellod] {} up on port {}", cfg.iface, cfg.port);
+    open_firewall(cfg.port);
 
     // Register (open, no account). Same pubkey re-registering refreshes + new secret.
+    // vpn4/vpn6 tell the website which tunnel subnets this server uses, so issued
+    // client configs always match THIS server (critical when customized via VY_VPN4/6).
     let body = format!(
-        "{{\"name\":\"{n}\",\"pubkey\":\"{pk}\",\"ipv4\":\"{v4}\",\"ipv6\":\"{v6}\",\"port\":{port},\"version\":\"vpnyellod {ver}\"}}",
+        "{{\"name\":\"{n}\",\"pubkey\":\"{pk}\",\"ipv4\":\"{v4}\",\"ipv6\":\"{v6}\",\"port\":{port},\"version\":\"vpnyellod {ver}\",\"vpn4\":\"{w4}\",\"vpn6\":\"{w6}\"}}",
         n = cfg.name, pk = pubkey,
         v4 = v4.clone().unwrap_or_default(), v6 = v6.clone().unwrap_or_default(),
-        port = cfg.port, ver = VERSION,
+        port = cfg.port, ver = VERSION, w4 = cfg.vpn4, w6 = cfg.vpn6,
     );
     let url = format!("{}/api/servers/register", cfg.registry);
     let resp = curl_post(&url, &body).unwrap_or_else(|e| { eprintln!("error: register failed: {e}"); std::process::exit(1); });
@@ -760,6 +790,14 @@ fn cmd_status() {
         println!("note     : address seen from internet, not bound locally — forward UDP {} on router", cfg.port);
     }
     println!("tunnel   : {} (port {}) {}", cfg.iface, cfg.port, if iface_exists(&cfg) { "UP" } else { "DOWN" });
+    // Prove the UDP port is actually listening (handshake timeouts = this or firewall).
+    let hexport = format!(":{:04X}", cfg.port);
+    let proc_hit = |f: &str| std::fs::read_to_string(f).map(|t| t.lines().skip(1).any(|l| {
+        l.split_whitespace().nth(1).map(|a| a.to_uppercase().ends_with(&hexport)).unwrap_or(false)
+    })).unwrap_or(false);
+    let listening = run_out("sh", &["-c", &format!("ss -uln 2>/dev/null | grep -w ':{}'", cfg.port)]).map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || proc_hit("/proc/net/udp") || proc_hit("/proc/net/udp6");
+    println!("listening: {} (UDP {})", if listening { "YES" } else { "NO — restart with `sudo vpnyellod on`" }, cfg.port);
     if iface_exists(&cfg) {
         if let Some(peers) = run_out("wg", &["show", &cfg.iface, "peers"]) {
             let n = if peers.is_empty() { 0 } else { peers.split_whitespace().count() };
