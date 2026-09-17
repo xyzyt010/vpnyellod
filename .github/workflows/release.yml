@@ -1,0 +1,42 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            asset: vpnyellod-x86_64-linux.tar.gz
+          - runner: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+            asset: vpnyellod-aarch64-linux.tar.gz
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install aarch64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update -y && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      - name: Package
+        run: |
+          mkdir -p pkg
+          cp target/${{ matrix.target }}/release/vpnyellod pkg/
+          cp install.sh README.md pkg/
+          cp systemd/vpnyellod.service pkg/
+          tar -czf ${{ matrix.asset }} -C pkg .
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
+          generate_release_notes: true
