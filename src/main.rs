@@ -426,18 +426,19 @@ fn ensure_addrs(cfg: &Cfg) {
 /// Open the WireGuard UDP port in every local firewall present.
 /// Without this, handshakes time out even though everything else is correct.
 fn open_firewall(port: u16) {
+    let p = port.to_string();
     // ufw (Ubuntu/Debian default): only touch it when it's active.
-    if let Some(st) = run_out("ufw", &["status"]) {
-        if st.lines().next().unwrap_or("").contains("Status: active") {
-            if run("ufw", &["allow", &format!("{port}/udp")]) {
-                println!("[vpnyellod] ufw: allowed {port}/udp");
-            } else {
-                eprintln!("[vpnyellod] WARN: ufw is active but the allow rule failed — run: sudo ufw allow {port}/udp");
-            }
+    let ufw_active = run_out("ufw", &["status"]).map(|st| st.lines().next().unwrap_or("").contains("Status: active")).unwrap_or(false);
+    if ufw_active {
+        if run("ufw", &["allow", &format!("{port}/udp")]) {
+            println!("[vpnyellod] ufw: allowed {port}/udp");
+        } else {
+            eprintln!("[vpnyellod] WARN: ufw is active but the allow rule failed — run: sudo ufw allow {port}/udp");
         }
     }
     // firewalld (Fedora/RHEL default): only touch it when running.
-    if run_out("firewall-cmd", &["--state"]).map(|s| s.trim() == "running").unwrap_or(false) {
+    let fw_running = run_out("firewall-cmd", &["--state"]).map(|s| s.trim() == "running").unwrap_or(false);
+    if fw_running {
         let rule = format!("{port}/udp");
         if run("firewall-cmd", &["--permanent", "--add-port", &rule]) && run("firewall-cmd", &["--reload"]) {
             println!("[vpnyellod] firewalld: allowed {rule}");
@@ -445,9 +446,33 @@ fn open_firewall(port: u16) {
             eprintln!("[vpnyellod] WARN: firewalld is running but the rule failed — run: sudo firewall-cmd --permanent --add-port={rule} && sudo firewall-cmd --reload");
         }
     }
+    // Neither manager (Oracle/cloud Ubuntu images, minimal installs): raw
+    // iptables INPUT rules still block everything — insert our ACCEPT on top.
+    // Idempotent (-C check first), both families.
+    if !ufw_active && !fw_running {
+        for cmd in ["iptables", "ip6tables"] {
+            let check = [cmd, "-C", "INPUT", "-p", "udp", "--dport", &p, "-j", "ACCEPT"];
+            if run(check[0], &check[1..]) {
+                continue;
+            }
+            let ins = [cmd, "-I", "INPUT", "-p", "udp", "--dport", &p, "-j", "ACCEPT"];
+            if run(ins[0], &ins[1..]) {
+                println!("[vpnyellod] {cmd}: allowed {port}/udp on INPUT");
+            }
+        }
+    }
     // Cloud security groups (AWS/Oracle/Azure/Hetzner/...) can't be automated —
     // always remind, it's the #1 cause of handshake timeouts on VPS boxes.
     println!("[vpnyellod] If this is a cloud VPS, ALSO open UDP {port} in the provider firewall/security-group console.");
+}
+
+/// Remove the raw-iptables rules added by open_firewall (ufw/firewalld rules are
+/// left alone — they were made through the proper managers).
+fn close_firewall(port: u16) {
+    let p = port.to_string();
+    for cmd in ["iptables", "ip6tables"] {
+        let _ = run(cmd, &["-D", "INPUT", "-p", "udp", "--dport", &p, "-j", "ACCEPT"]);
+    }
 }
 
 fn bring_up(cfg: &Cfg) -> Result<(), String> {
@@ -777,6 +802,7 @@ fn cmd_off() {
         let _ = run("wg-quick", &["down", &cfg.iface]);
         println!("[vpnyellod] {} down", cfg.iface);
     }
+    close_firewall(cfg.port);
     println!("[vpnyellod] OFF");
 }
 
