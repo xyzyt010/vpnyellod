@@ -22,6 +22,7 @@ sudo vpnyellod on                 # set up + register + start daemon
 sudo vpnyellod on --name my-box   # custom display name
 vpnyellod status                  # tunnel, IPs, peers, last sync
 sudo vpnyellod off                # deregister + stop (keeps files, re-on anytime)
+sudo vpnyellod restart            # stop + fresh start, same entry, keys + name kept
 sudo vpnyellod uninstall          # remove EVERYTHING: entry, daemon, rules, configs, keys
 ```
 
