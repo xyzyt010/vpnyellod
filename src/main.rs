@@ -119,6 +119,7 @@ fn run_out(cmd: &str, args: &[&str]) -> Option<String> {
 #[derive(Debug, Clone)]
 struct Addr {
     ip: String,
+    iface: String,
     stable: bool,
     deprecated: bool,
     preferred_lft: u64,
@@ -186,6 +187,7 @@ fn list_addrs(family: &str) -> Vec<Addr> {
         }
         v.push(Addr {
             ip,
+            iface: t[1].to_string(),
             stable: !line.contains(" temporary"),
             deprecated: line.contains(" deprecated"),
             preferred_lft: preferred_lft(line),
@@ -210,7 +212,7 @@ fn nanos() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)
 }
 
-fn select_best(cands: &[Addr], def: &Option<String>) -> Option<String> {
+fn select_best(cands: &[Addr], def: &Option<String>) -> Option<Addr> {
     if cands.is_empty() {
         return None;
     }
@@ -218,7 +220,7 @@ fn select_best(cands: &[Addr], def: &Option<String>) -> Option<String> {
     // IPv6 when a stable global exists (temp expires within the hour).
     if let Some(src) = def {
         if let Some(a) = cands.iter().find(|a| &a.ip == src && !a.deprecated && a.stable) {
-            return Some(a.ip.clone());
+            return Some(a.clone());
         }
     }
     let mut bs = i64::MIN;
@@ -235,13 +237,78 @@ fn select_best(cands: &[Addr], def: &Option<String>) -> Option<String> {
         if !a.stable { s -= 100; }
         s == bs && a.preferred_lft == bl
     }).collect();
-    Some(tied[(nanos() % tied.len() as u64) as usize].ip.clone())
+    Some(tied[(nanos() % tied.len() as u64) as usize].clone())
 }
 
-fn detect() -> (Option<String>, Option<String>) {
-    let v4 = select_best(&list_addrs("inet"), &default_src(false));
-    let v6 = select_best(&list_addrs("inet6"), &default_src(true));
-    (v4, v6)
+// ============================ External cross-check (never miss an address) ============
+// Local `ip addr` enumeration can miss the usable address (NAT gateways, PPP,
+// containers, unusual drivers). So we ALSO ask the internet what it sees and
+// merge: a directly-bound local global always wins; otherwise the externally
+// visible address is used (with a port-forward warning when it isn't local).
+
+/// Query one echo service for our own address as seen from the internet.
+fn echo_ip(url: &str, v6: bool) -> Option<String> {
+    let fam = if v6 { "-6" } else { "-4" };
+    let out = Command::new("curl").args(["-fsSL", "-m", "8", fam, url]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let ok = if v6 {
+        v6_global(&s)
+    } else {
+        s.parse::<std::net::Ipv4Addr>().is_ok()
+    };
+    ok.then_some(s)
+}
+
+fn external_ips() -> (Option<String>, Option<String>) {
+    // v4 and v6 lookups run in parallel; each tries two independent services.
+    let h4 = std::thread::spawn(|| {
+        echo_ip("https://api.ipify.org", false)
+            .or_else(|| echo_ip("https://ipv4.icanhazip.com", false))
+    });
+    let h6 = std::thread::spawn(|| {
+        echo_ip("https://api6.ipify.org", true)
+            .or_else(|| echo_ip("https://ipv6.icanhazip.com", true))
+    });
+    (h4.join().ok().flatten(), h6.join().ok().flatten())
+}
+
+#[derive(Debug, Clone, Default)]
+struct Detection {
+    local_v4: Option<Addr>,
+    local_v6: Option<Addr>,
+    ext_v4: Option<String>,
+    ext_v6: Option<String>,
+    final_v4: Option<String>,
+    final_v6: Option<String>,
+    /// True when we must rely on an address that isn't bound locally
+    /// (NAT/container) — inbound UDP needs a router port-forward.
+    nat_warning: bool,
+}
+
+fn detect_full() -> Detection {
+    let local_v4 = select_best(&list_addrs("inet"), &default_src(false));
+    let local_v6 = select_best(&list_addrs("inet6"), &default_src(true));
+    let (ext_v4, ext_v6) = external_ips();
+    let final_v4 = local_v4.clone().map(|a| a.ip).or_else(|| ext_v4.clone());
+    let final_v6 = local_v6.clone().map(|a| a.ip).or_else(|| ext_v6.clone());
+    let nat_warning = (local_v4.is_none() && ext_v4.is_some())
+        || (local_v6.is_none() && ext_v6.is_some());
+    Detection { local_v4, local_v6, ext_v4, ext_v6, final_v4, final_v6, nat_warning }
+}
+
+fn print_report(d: &Detection, port: u16) {
+    let loc = |a: &Option<Addr>| a.as_ref().map(|x| format!("{} ({})", x.ip, x.iface)).unwrap_or_else(|| "-".into());
+    println!("[detect] ipv4: local={} | seen-from-internet={} | USE={}",
+        loc(&d.local_v4), d.ext_v4.as_deref().unwrap_or("-"), d.final_v4.as_deref().unwrap_or("NONE"));
+    println!("[detect] ipv6: local={} | seen-from-internet={} | USE={}",
+        loc(&d.local_v6), d.ext_v6.as_deref().unwrap_or("-"), d.final_v6.as_deref().unwrap_or("NONE"));
+    if d.nat_warning {
+        println!("[detect] NOTE: usable address is not bound on this machine (NAT/container).");
+        println!("[detect] Forward UDP {port} on your router to this machine, or clients cannot connect.");
+    }
 }
 
 fn default_iface() -> Option<String> {
@@ -550,7 +617,8 @@ fn record_heartbeat(server_id: &str, applied: usize) {
 }
 
 fn sync_once(cfg: &Cfg, server_id: &str, secret: &str) -> Result<usize, String> {
-    let (v4, v6) = detect();
+    let det = detect_full();
+    let (v4, v6) = (det.final_v4, det.final_v6);
     let wanted = heartbeat(cfg, server_id, secret, &v4, &v6)?;
     if !iface_exists(cfg) {
         bring_up(cfg)?;
@@ -604,10 +672,11 @@ fn cmd_on(args: &[String]) {
             std::process::exit(1);
         }
     }
-    let (v4, v6) = detect();
-    println!("[vpnyellod] detected: ipv4={} ipv6={}", v4.as_deref().unwrap_or("-"), v6.as_deref().unwrap_or("-"));
+    let det = detect_full();
+    print_report(&det, cfg.port);
+    let (v4, v6) = (det.final_v4.clone(), det.final_v6.clone());
     if v4.is_none() && v6.is_none() {
-        eprintln!("error: no global IPv4 or IPv6 found — connect to the internet first");
+        eprintln!("error: no IPv4 or IPv6 reachable (locally or from the internet) — connect this machine to the internet first");
         std::process::exit(1);
     }
     let privkey = ensure_keys(&cfg.key_path).unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1); });
@@ -632,6 +701,11 @@ fn cmd_on(args: &[String]) {
     println!("[vpnyellod] registered as \"{}\" → {}/ (id {sid})", cfg.name, cfg.registry);
 
     // Daemon: systemd if available, else detached background loop.
+    // Re-running `on` first stops any previous daemon (exact PID from pidfile).
+    if let Ok(pid) = fs::read_to_string(PID_FILE) {
+        let _ = run("kill", &[pid.trim()]);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
     if has_systemd() {
         let _ = run("systemctl", &["daemon-reload"]);
         if !run("systemctl", &["enable", "--now", "vpnyellod.service"]) {
@@ -678,10 +752,13 @@ fn cmd_off() {
 
 fn cmd_status() {
     let cfg = Cfg::load();
-    let (v4, v6) = detect();
+    let det = detect_full();
     println!("vpnyellod {VERSION}");
     println!("registry : {}", cfg.registry);
-    println!("detected : ipv4={} ipv6={}", v4.as_deref().unwrap_or("-"), v6.as_deref().unwrap_or("-"));
+    println!("detected : ipv4={} ipv6={}", det.final_v4.as_deref().unwrap_or("-"), det.final_v6.as_deref().unwrap_or("-"));
+    if det.nat_warning {
+        println!("note     : address seen from internet, not bound locally — forward UDP {} on router", cfg.port);
+    }
     println!("tunnel   : {} (port {}) {}", cfg.iface, cfg.port, if iface_exists(&cfg) { "UP" } else { "DOWN" });
     if iface_exists(&cfg) {
         if let Some(peers) = run_out("wg", &["show", &cfg.iface, "peers"]) {
@@ -734,6 +811,7 @@ fn usage() -> ! {
     eprintln!("  sudo vpnyellod on [--name NAME] [--registry URL]");
     eprintln!("  sudo vpnyellod off");
     eprintln!("  vpnyellod status");
+    eprintln!("  vpnyellod detect   (show local vs internet-visible IPs, no changes)");
     std::process::exit(2);
 }
 
@@ -743,6 +821,7 @@ fn main() {
         "on" => cmd_on(&args[1..].to_vec()),
         "off" => cmd_off(),
         "status" => cmd_status(),
+        "detect" => print_report(&detect_full(), Cfg::load().port),
         "daemon" => cmd_daemon(),
         "version" | "--version" => println!("vpnyellod {VERSION}"),
         _ => usage(),
